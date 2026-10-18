@@ -169,7 +169,6 @@ export function useAgent(
 
   return { agent, loading, error, isStale, refetch };
 }
-=======
 
 /**
  * Lazily resolve a default IdentityClient. Kept as a separate indirection so

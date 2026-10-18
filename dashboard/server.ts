@@ -41,12 +41,14 @@ import {
   invalidateSession,
   requireAuth,
   requireMatchingWallet,
+  requireAdmin,
+  readOnly,
 } from "./lib/auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// ── #778: Strict Content Security Policy with per-request nonces ─────────────
+// ── #618: Configurable Content Security Policy with per-request nonces ───────
 // Generate a fresh cryptographic nonce for every request. The nonce is stored
 // on res.locals so route handlers and the HTML-injection middleware can read it.
 app.use((_req: Request, res: Response, next: NextFunction) => {
@@ -66,10 +68,45 @@ const STELLAR_CONNECT_SRCS = [
   "https://channels.openzeppelin.com",
 ];
 
+/**
+ * #618 — Resolve the Content Security Policy directives from environment
+ * variables with secure defaults.
+ *
+ * Operators can extend the allow-lists via env vars without touching code:
+ *   CSP_SCRIPT_SRC  — comma-separated extra script-src origins
+ *   CSP_STYLE_SRC   — comma-separated extra style-src origins
+ *   CSP_IMG_SRC     — comma-separated extra img-src origins
+ *   CSP_CONNECT_SRC — comma-separated extra connect-src origins
+ *   CSP_FONT_SRC    — comma-separated extra font-src origins
+ *   CSP_REPORT_URI  — where the browser POSTs violation reports
+ *   CSP_REPORT_ONLY — "true" enables Report-Only mode (doesn't block)
+ *
+ * Production defaults are restrictive: only 'self', the CDN hosts the
+ * dashboard actually needs, and a per-request nonce for inline scripts.
+ */
+function parseCspList(envVar: string | undefined): string[] {
+  if (!envVar) return [];
+  return envVar
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const CSP_REPORT_ONLY = process.env.CSP_REPORT_ONLY === "true";
+const CSP_REPORT_URI = process.env.CSP_REPORT_URI;
+
+// Extra origins loaded from env (safely extendable without code changes).
+const cspExtraScriptSrc = parseCspList(process.env.CSP_SCRIPT_SRC);
+const cspExtraStyleSrc = parseCspList(process.env.CSP_STYLE_SRC);
+const cspExtraImgSrc = parseCspList(process.env.CSP_IMG_SRC);
+const cspExtraConnectSrc = parseCspList(process.env.CSP_CONNECT_SRC);
+const cspExtraFontSrc = parseCspList(process.env.CSP_FONT_SRC);
+
 app.use(
   helmet({
     contentSecurityPolicy: {
       useDefaults: false,
+      reportOnly: CSP_REPORT_ONLY,
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: [
@@ -82,20 +119,25 @@ app.use(
           // Stellar Wallets Kit UMD bundle served from jsdelivr CDN.
           "https://cdn.jsdelivr.net",
           "https://unpkg.com",
+          ...cspExtraScriptSrc,
         ],
         styleSrc: [
           "'self'",
           (_req, res) => `'nonce-${(res as unknown as Response).locals.cspNonce}'`,
           "https://fonts.googleapis.com",
+          ...cspExtraStyleSrc,
         ],
-        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-        imgSrc: ["'self'", "data:", "https:"],
-        connectSrc: ["'self'", ...STELLAR_CONNECT_SRCS, "wss:"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:", ...cspExtraFontSrc],
+        imgSrc: ["'self'", "data:", "https:", ...cspExtraImgSrc],
+        connectSrc: ["'self'", ...STELLAR_CONNECT_SRCS, "wss:", ...cspExtraConnectSrc],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         formAction: ["'self'"],
         frameAncestors: ["'none'"],
         upgradeInsecureRequests: [],
+        // report-uri is deprecated in favor of report-to, but helmet supports
+        // both; we emit report-uri for broad browser compatibility.
+        ...(CSP_REPORT_URI ? { reportUri: [CSP_REPORT_URI] } : {}),
       },
     },
     // Keep other helmet defaults: HSTS, X-Frame-Options, etc.
@@ -176,12 +218,86 @@ async function withRpcFallback<T>(operation: (server: rpc.Server) => Promise<T>)
 const identityContract = new Contract(cfg.identityContract);
 const commerceContract = new Contract(cfg.commerceContract);
 
-const allowedOrigins = [
+// ── #998: Environment-Specific CORS Policies ──────────────────────────────────
+// Browser-origin access is explicit per environment (local, staging, production)
+// instead of relying on overly permissive defaults.
+//
+// Configuration (env vars):
+//   NODE_ENV          — "development" | "staging" | "production" (default: "development")
+//   ALLOWED_ORIGINS   — comma-separated list of allowed origins (highest priority)
+//   ALLOWED_ORIGIN    — single allowed origin (legacy / backward compatibility)
+//
+// When ALLOWED_ORIGINS / ALLOWED_ORIGIN is unset the defaults are:
+//   development: ["http://localhost:3000", "http://localhost:5173",
+//                 "http://127.0.0.1:3000", "http://127.0.0.1:5173"]
+//   staging:     [] (must be set explicitly — no wildcard defaults)
+//   production:  [] (must be set explicitly — no wildcard defaults)
+//
+// In production, if no origins are configured the server refuses to start
+// rather than silently allowing all origins (defense-in-depth).
+
+const NODE_ENV = (process.env.NODE_ENV ?? "development").toLowerCase() as
+  | "development"
+  | "staging"
+  | "production"
+  | string;
+
+const DEV_DEFAULT_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:5173",
-  process.env.ALLOWED_ORIGIN,
-  ...(process.env.ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()),
-].filter(Boolean) as string[];
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
+];
+
+/**
+ * Resolve the allowed CORS origins for the current environment.
+ *
+ * Production and staging are restrictive by default: the operator MUST
+ * provide origins via ALLOWED_ORIGINS or ALLOWED_ORIGIN.
+ * Development provides sensible localhost defaults for DX.
+ */
+function resolveCorsOrigins(): string[] {
+  const explicit = [
+    ...(process.env.ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim())
+      .filter(Boolean),
+    ...(process.env.ALLOWED_ORIGIN ? [process.env.ALLOWED_ORIGIN.trim()] : []),
+  ];
+
+  if (explicit.length > 0) {
+    return explicit;
+  }
+
+  // Environment-specific defaults.
+  switch (NODE_ENV) {
+    case "development":
+      return DEV_DEFAULT_ORIGINS;
+    case "staging":
+    case "production":
+      // Restrictive: no implicit origins. The operator must configure these.
+      return [];
+    default:
+      return DEV_DEFAULT_ORIGINS;
+  }
+}
+
+const allowedOrigins = resolveCorsOrigins();
+
+// In production, refuse to start with zero allowed origins to prevent
+// accidentally exposing the API to every origin.
+if (
+  (NODE_ENV === "production" || NODE_ENV === "staging") &&
+  allowedOrigins.length === 0
+) {
+  console.error(
+    `[CORS] FATAL: NODE_ENV=${NODE_ENV} but no ALLOWED_ORIGINS configured. ` +
+      "Set ALLOWED_ORIGINS=https://your-dashboard.example.com before starting.",
+  );
+  process.exit(1);
+}
+
+console.log(`[CORS] NODE_ENV=${NODE_ENV}, allowed origins:`, allowedOrigins);
 
 const mutatingBuckets = new Map<string, { count: number; resetAt: number }>();
 const MUTATING_RATE_LIMIT = Number(process.env.MUTATING_RATE_LIMIT ?? 30);
@@ -356,13 +472,26 @@ function auditAdminAction(req: Request, res: Response, next: NextFunction) {
 app.use(
   cors({
     origin: (origin, callback) => {
+      // Allow same-origin / server-to-server requests (no Origin header).
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
+        // #998: log rejected origins for observability.
+        console.warn(`[CORS] rejected origin: ${origin}`);
         callback(new Error("Not allowed by CORS"));
       }
     },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "X-Payment",
+      "X-Payment-Requirements",
+    ],
+    // Preflight response is cached by the browser for 10 minutes.
+    maxAge: 600,
   }),
 );
 
@@ -630,7 +759,8 @@ async function getTokenBalance(pubkey: string): Promise<string> {
 // --- API Routes ---
 
 // GET /api/demo-mode — lets the frontend know whether to skip Freighter auth
-app.get("/api/demo-mode", (_req, res) => {
+// #997 — Permission: read-only (public)
+app.get("/api/demo-mode", readOnly, (_req, res) => {
   res.json({
     enabled: DEMO_MODE,
     ...(DEMO_MODE && {
@@ -644,7 +774,8 @@ let statsCache: { ts: number; payload: unknown } | null = null;
 const STATS_CACHE_TTL_MS = Number(process.env.STATS_CACHE_TTL_MS ?? 5_000);
 
 // GET /api/stats
-app.get("/api/stats", async (req, res) => {
+// #997 — Permission: read-only (public)
+app.get("/api/stats", readOnly, async (req, res) => {
   try {
     const forceRefresh = req.query.refresh === "true";
     if (!forceRefresh && statsCache && Date.now() - statsCache.ts < STATS_CACHE_TTL_MS) {
@@ -666,6 +797,8 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
+// GET /api/audit-trail
+// #997 — Permission: admin (audit trail exposes administrative actions)
 app.get("/api/audit-trail", requireAuth, (_req, res) => {
   res.json(auditTrail.slice().reverse());
 });
@@ -709,7 +842,8 @@ app.get("/api/stream", (req, res) => {
 });
 
 // GET /api/wallets
-app.get("/api/wallets", async (_req, res) => {
+// #997 — Permission: read-only (public)
+app.get("/api/wallets", readOnly, async (_req, res) => {
   try {
     const buyerPub = buyerKeypair.publicKey();
     const sellerPub = sellerKeypair.publicKey();
@@ -729,7 +863,8 @@ app.get("/api/wallets", async (_req, res) => {
 });
 
 // GET /api/agents
-app.get("/api/agents", async (req, res) => {
+// #997 — Permission: read-only (public)
+app.get("/api/agents", readOnly, async (req, res) => {
   try {
     if (!("page" in req.query) && !("pageSize" in req.query)) {
       const agents = await getAllAgents();
@@ -745,11 +880,11 @@ app.get("/api/agents", async (req, res) => {
 });
 
 // POST /api/agents/register
+// #997 — Permission: admin (mutates on-chain identity state)
 app.post(
   "/api/agents/register",
   auditAdminAction,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const parsed = registerAgentSchema.parse(req.body);
@@ -774,7 +909,8 @@ app.post(
 );
 
 // GET /api/jobs
-app.get("/api/jobs", async (req, res) => {
+// #997 — Permission: read-only (public)
+app.get("/api/jobs", readOnly, async (req, res) => {
   try {
     const parsed = jobsQuerySchema.parse(req.query);
     let jobs = await getAllJobs();
@@ -811,7 +947,8 @@ app.get("/api/jobs", async (req, res) => {
 });
 
 // POST /api/jobs/create
-app.post("/api/jobs/create", auditAdminAction, optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
+// #997 — Permission: admin (mutates on-chain escrow, transfers funds)
+app.post("/api/jobs/create", auditAdminAction, requireAdmin, async (req, res) => {
   try {
     const parsed = createJobSchema.parse(req.body);
     const { wallet, provider, evaluator, budget, description } = parsed;
@@ -842,11 +979,11 @@ app.post("/api/jobs/create", auditAdminAction, optionalAuthMiddleware, requireDa
 });
 
 // POST /api/jobs/:id/submit
+// #997 — Permission: admin (mutates on-chain job state)
 app.post(
   "/api/jobs/:id/submit",
   auditAdminAction,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const params = numericIdParamSchema.parse(req.params);
@@ -864,8 +1001,7 @@ app.post(
 app.post(
   "/api/jobs/:id/approve",
   auditAdminAction,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const params = numericIdParamSchema.parse(req.params);
@@ -881,11 +1017,11 @@ app.post(
 );
 
 // POST /api/jobs/:id/complete
+// #997 — Permission: admin (triggers on-chain payout)
 app.post(
   "/api/jobs/:id/complete",
   auditAdminAction,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const params = numericIdParamSchema.parse(req.params);
@@ -901,11 +1037,11 @@ app.post(
 );
 
 // POST /api/jobs/:id/cancel
+// #997 — Permission: admin (triggers on-chain refund)
 app.post(
   "/api/jobs/:id/cancel",
   auditAdminAction,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const params = numericIdParamSchema.parse(req.params);
@@ -922,7 +1058,8 @@ app.post(
 
 // PUT /api/jobs/:id — cancel a job; builds unsigned XDR when publicKey provided,
 // or invokes directly when wallet (server keypair) is provided.
-app.put("/api/jobs/:id", auditAdminAction, optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
+// #997 — Permission: admin (mutates on-chain job state)
+app.put("/api/jobs/:id", auditAdminAction, requireAdmin, async (req, res) => {
   try {
     const { action, publicKey, wallet } = req.body;
     if (action !== "cancel") {
@@ -953,7 +1090,9 @@ app.put("/api/jobs/:id", auditAdminAction, optionalAuthMiddleware, requireDashbo
   }
 });
 
-app.post("/api/dispute-job", optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
+// POST /api/dispute-job
+// #997 — Permission: admin (builds unsigned transaction for on-chain dispute)
+app.post("/api/dispute-job", requireAdmin, async (req, res) => {
   try {
     const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
@@ -969,7 +1108,9 @@ app.post("/api/dispute-job", optionalAuthMiddleware, requireDashboardWallet, asy
   }
 });
 
-app.post("/api/claim-refund", optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
+// POST /api/claim-refund
+// #997 — Permission: admin (builds unsigned transaction for on-chain refund)
+app.post("/api/claim-refund", requireAdmin, async (req, res) => {
   try {
     const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
@@ -1006,11 +1147,11 @@ async function buildTxXdr(publicKey: string, op: xdr.Operation): Promise<string>
 }
 
 // POST /api/build/register — build unsigned register agent tx
+// #997 — Permission: admin (builds transaction for on-chain identity mutation)
 app.post(
   "/api/build/register",
   rateLimitMutating,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const parsed = buildRegisterSchema.parse(req.body);
@@ -1029,11 +1170,11 @@ app.post(
 );
 
 // POST /api/build/createJob — build unsigned create_job tx
+// #997 — Permission: admin (builds transaction for on-chain fund transfer)
 app.post(
   "/api/build/createJob",
   rateLimitMutating,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const parsed = buildCreateJobSchema.parse(req.body);
@@ -1066,7 +1207,8 @@ app.post(
 );
 
 // POST /api/build/submit — build unsigned submit tx
-app.post("/api/build/submit", rateLimitMutating, optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
+// #997 — Permission: admin (builds transaction for on-chain job submission)
+app.post("/api/build/submit", rateLimitMutating, requireAdmin, async (req, res) => {
   try {
     const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
@@ -1084,11 +1226,11 @@ app.post("/api/build/submit", rateLimitMutating, optionalAuthMiddleware, require
 });
 
 // POST /api/build/complete — build unsigned complete tx
+// #997 — Permission: admin (builds transaction for on-chain payout)
 app.post(
   "/api/build/complete",
   rateLimitMutating,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const parsed = buildUnsignedActionSchema.parse(req.body);
@@ -1109,8 +1251,7 @@ app.post(
 app.post(
   "/api/build/approve",
   rateLimitMutating,
-  optionalAuthMiddleware,
-  requireDashboardWallet,
+  requireAdmin,
   async (req, res) => {
     try {
       const parsed = buildUnsignedActionSchema.parse(req.body);
@@ -1129,7 +1270,8 @@ app.post(
 );
 
 // POST /api/build/cancel — build unsigned cancel tx
-app.post("/api/build/cancel", rateLimitMutating, optionalAuthMiddleware, requireDashboardWallet, async (req, res) => {
+// #997 — Permission: admin (builds transaction for on-chain refund)
+app.post("/api/build/cancel", rateLimitMutating, requireAdmin, async (req, res) => {
   try {
     const parsed = buildUnsignedActionSchema.parse(req.body);
     const op = commerceContract.call(
@@ -1146,7 +1288,8 @@ app.post("/api/build/cancel", rateLimitMutating, optionalAuthMiddleware, require
 });
 
 // POST /api/submit — submit a Freighter-signed transaction
-app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, res) => {
+// #997 — Permission: admin (submits signed transaction to the network)
+app.post("/api/submit", rateLimitMutating, requireAdmin, async (req, res) => {
   try {
     const parsed = submitXdrSchema.parse(req.body);
     const tx = TransactionBuilder.fromXDR(parsed.signedXdr, cfg.networkPassphrase);
@@ -1188,7 +1331,8 @@ app.post("/api/submit", rateLimitMutating, optionalAuthMiddleware, async (req, r
 });
 
 // GET /api/balance/:pubkey — get XLM + MUSD balance for any public key
-app.get("/api/balance/:pubkey", async (req, res) => {
+// #997 — Permission: read-only (public)
+app.get("/api/balance/:pubkey", readOnly, async (req, res) => {
   try {
     const params = z.object({ pubkey: stellarAddressSchema }).parse(req.params);
     const [xlm, musd] = await Promise.all([

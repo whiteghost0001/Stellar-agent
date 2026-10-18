@@ -67,6 +67,19 @@ export {
 // #781 — RPC failover pool (exported for advanced usage / observability)
 export { RpcFailoverPool, type RpcEndpointHealth } from "./baseClient.js";
 
+// #656 — Server-Sent Events streaming for long-running job results
+export {
+  streamJobEvents,
+  streamJobResult,
+  pollJobUntilTerminal,
+  type JobStreamEvent,
+  type JobResultChunk,
+  type JobStreamHandle,
+  type StreamJobEventsOptions,
+  type StreamJobResultOptions,
+  type PollJobOptions,
+} from "./jobStream.js";
+
 /**
  * The current semantic version of the `marc-stellar-sdk` package.
  *

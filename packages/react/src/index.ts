@@ -4,27 +4,58 @@
 export type { Agent, Job, JobStatus, MarcConfig } from 'marc-stellar-sdk';
 
 // Shared async state type.
-export type { AsyncState } from './hooks/useAsync';
+export type { AsyncState, UseAsyncResult } from './hooks/useAsync';
+export { useAsync } from './hooks/useAsync';
 
 // Hooks and their option/result interfaces.
-export { useAgent } from './hooks/useAgent';
+export { useAgent, clearAgentCache } from './hooks/useAgent';
 export type { UseAgentOptions, UseAgentResult } from './hooks/useAgent';
 
-export { useJob } from './hooks/useJob';
+export { useJob, clearJobCache, isTerminalJobStatus, parseJobId } from './hooks/useJob';
 export type { UseJobOptions, UseJobResult } from './hooks/useJob';
 
 export { useCreateJob } from './hooks/useCreateJob';
 export type { UseCreateJobResult } from './hooks/useCreateJob';
 
 export { useCommerce } from './hooks/useCommerce';
-export type { UseCommerceResult } from './hooks/useCommerce';
+export type {
+  UseCommerceOptions,
+  UseCommerceResult,
+  CreateJobParams,
+  SubmitJobParams,
+  CompleteJobParams,
+  CancelJobParams,
+  CreateJobResult,
+} from './hooks/useCommerce';
 
-export { useWallet } from './hooks/useWallet';
-export type { UseWalletOptions, UseWalletResult } from './hooks/useWallet';
+export { usePaymentChannel } from './hooks/usePaymentChannel';
+export type {
+  UsePaymentChannelOptions,
+  UsePaymentChannelResult,
+  OpenChannelParams,
+} from './hooks/usePaymentChannel';
 
-// Component prop interfaces.
+export { useWallet, useWalletState } from './hooks/useWallet';
+export type {
+  UseWalletOptions,
+  UseWalletResult,
+  WalletProvider as StellarWalletProvider,
+  WalletStatus,
+  WalletBalances,
+} from './hooks/useWallet';
+
+// Multi-wallet context provider
+export { WalletProvider, WalletContext, useWalletContext } from './context/WalletContext';
+export type { WalletProviderProps, WalletContextValue } from './context/WalletContext';
+
+// Components and prop interfaces.
+export { AgentCard } from './components/AgentCard';
 export type { AgentCardProps } from './components/AgentCard';
+
+export { JobStatusBadge } from './components/JobStatusBadge';
 export type { JobStatusBadgeProps } from './components/JobStatusBadge';
+
+export { EscrowStepper } from './components/EscrowStepper';
 export type { EscrowStepperProps } from './components/EscrowStepper';
 
 // Wallet connect button component and its props.
